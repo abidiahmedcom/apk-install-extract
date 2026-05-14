@@ -38,16 +38,14 @@ jobs:
       - name: Download and unzip APKs
         run: |
           mkdir ${{env.all_apk_dir}}          
-          # worfklow_dispatch
-          [ -n "${{inputs.apk_zip_url}}" ] && wget ${{inputs.apk_zip_url}} -O ${{env.all_apk_dir}}.zip
-          # default run
-          [ -z "${{inputs.apk_zip_url}}" ] && wget ${{env.default_apk_zip_url}} -O ${{env.all_apk_dir}}.zip
+          [ -n "${{github.event.inputs.apk_zip_url}}" ] && wget "${{github.event.inputs.apk_zip_url}}" -O ${{env.all_apk_dir}}.zip
+          [ -z "${{github.event.inputs.apk_zip_url}}" ] && wget ${{env.default_apk_zip_url}} -O ${{env.all_apk_dir}}.zip
           unzip ${{env.all_apk_dir}}.zip -d ${{env.all_apk_dir}}
-          find .
 
       - name: Setup paths
         id: getpaths
         run: |                              
+          # Anchor to base.apk to avoid running 3 times for one set of splits
           echo "apkpaths=$(python -c 'import pathlib; print([str(list(pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/base.apk"))[0])])')" >> "$GITHUB_OUTPUT"          
         shell: bash
 
@@ -65,22 +63,20 @@ jobs:
       fail-fast: false
       matrix:        
         apkpath: ${{fromJson(needs.generate-matrix.outputs.apkpaths)}}
-        arch: ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']        
+        # NOTE: armeabi-v7a will fail on GitHub runners without an x86_64 split APK!
+        arch: ['x86_64', 'armeabi-v7a']        
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name : install adb
-        run: | 
-          sudo apt install adb aapt
+        run: sudo apt install adb aapt
       - name: Install reDroid dependencies
         run: |
-          ## install required kernel modules          
           sudo apt install linux-modules-extra-`uname -r`
           sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
-          #sudo modprobe ashmem_linux          
       - name: Run emulator
         run: |
-          mkdir data
+          mkdir -p data
           docker run -itd --rm --privileged --pull always -v $(pwd)/data:/data -p ${{env.avd_port}}:5555 redroid/redroid:12.0.0-latest          
 
       - name: Download runner artifacts 
@@ -88,60 +84,64 @@ jobs:
         with:
           name: ${{env.all_apk_dir}}
           path: ${{env.all_apk_dir}}
-        
 
       - name: adb connect install
         run: |                    
           adb connect ${{env.avd_name}}
-          adb devices -l 
-          # Install ALL split APKs found in the zip together
+          adb wait-for-device
+          # Install all split APKs together
           adb -s ${{env.avd_name}} install-multiple --abi ${{matrix.arch}} $(find ${{env.all_apk_dir}} -name "*.apk")
           
       - name: adb start main activity
         run: |                    
-          # adb -s localhost:5555 shell am start -n com.whatsapp/com.whatsapp.Main          
+          sleep 10
           ./adb-run.sh "${{matrix.apkpath}}"
+          # Wait for Superpack decompression to complete
+          sleep 20
 
       - name: get package name ver
+        id: info
+        continue-on-error: true
         run : |
-          echo "apkpkgver=$(./get-pkgver.sh '${{matrix.apkpath}}')" >> "$GITHUB_ENV"
-          echo "apkpkg=$(./get-pkg.sh '${{matrix.apkpath}}')" >> "$GITHUB_ENV"
-          echo "$apkpkgver"         
-          echo "$apkpkg"     
+          VER=$(./get-pkgver.sh '${{matrix.apkpath}}' || echo "unknown")
+          PKG=$(./get-pkg.sh '${{matrix.apkpath}}' || echo "com.whatsapp")
+          echo "apkpkgver=$VER" >> "$GITHUB_ENV"
+          echo "apkpkg=$PKG" >> "$GITHUB_ENV"
 
       - name: create output dir
         run: | 
-          mkdir ${{ env.apkpkgver }}
+          # Ensure a directory exists even if the previous steps failed
+          mkdir -p "${{ env.apkpkgver }}"
 
       - name: aapt dump badging
+        continue-on-error: true
         run: | 
-          aapt dump badging "${{matrix.apkpath}}" >  ${{ env.apkpkgver }}/${{ env.apkpkgver }}.badging.txt         
-          cat ${{ env.apkpkgver }}/${{ env.apkpkgver }}.badging.txt
+          aapt dump badging "${{matrix.apkpath}}" > "${{ env.apkpkgver }}/badging.txt"
       
       - name: fix data permissions
         if: always()
         run: | 
-          # stop docker containers
-          docker stop $(docker ps -a -q)
-          sudo chown -R runner:runner data
+          docker stop $(docker ps -a -q) || true
+          sudo chown -R runner:runner data || true
 
       - name: compress archive data
+        continue-on-error: true
         run: |
-          mv data data-${{ env.apkpkgver }}-${{matrix.arch}} 
-          tar cvzf ${{ env.apkpkgver }}/${{ env.apkpkgver }}.${{matrix.arch}}.data.tar.gz data-${{ env.apkpkgver }}-${{matrix.arch}}/data/${{ env.apkpkg }}
+          mv data "data-${{ matrix.arch }}"
+          tar cvzf "${{ env.apkpkgver }}/extracted_${{ matrix.arch }}.tar.gz" "data-${{ matrix.arch }}/data/${{ env.apkpkg }}" || true
       
-      - name: Upload data
+      - name: Upload extracted data
         uses: actions/upload-artifact@v4
         if: always()
         with:
-            name: all_package_data
+            name: package_data_${{ matrix.arch }}
             path: ${{ env.apkpkgver }}
-            retention-days: 25
+            retention-days: 7
             
-      - name: Upload all data
+      - name: Upload full emulator data
         uses: actions/upload-artifact@v4
         if: always()
         with:
-            name: all_data
-            path: data-${{ env.apkpkgver }}-${{matrix.arch}}/data/
-            retention-days: 5
+            name: full_data_${{ matrix.arch }}
+            path: data-${{ matrix.arch }}/data/
+            retention-days: 1
