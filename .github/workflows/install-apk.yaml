@@ -48,8 +48,9 @@ jobs:
       - name: Setup paths
         id: getpaths
         run: |                              
-          echo "apkpaths=$(python -c 'import pathlib; print([str(file) for file in pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/*.apk")])')" >> "$GITHUB_OUTPUT"          
+          echo "apkpaths=$(python -c 'import pathlib; print([str(list(pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/base.apk"))[0])])')" >> "$GITHUB_OUTPUT"          
         shell: bash
+
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
@@ -93,7 +94,8 @@ jobs:
         run: |                    
           adb connect ${{env.avd_name}}
           adb devices -l 
-          adb -s ${{env.avd_name}} install --abi ${{matrix.arch}} "${{matrix.apkpath}}"
+          # Install ALL split APKs found in the zip together
+          adb -s ${{env.avd_name}} install-multiple --abi ${{matrix.arch}} $(find ${{env.all_apk_dir}} -name "*.apk")
           
       - name: adb start main activity
         run: |                    
